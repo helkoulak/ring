@@ -14,23 +14,21 @@
 
 use super::{
     aes::{self, Counter},
-    block::{Block, BLOCK_LEN},
-    gcm, shift, Aad, Nonce, Tag,
+    gcm, shift, Aad, Block, Direction, Nonce, Tag, BLOCK_LEN,
 };
-use crate::{
-    aead, cpu, error,
-    polyfill::{self},
-};
-use core::ops::RangeFrom;
+use crate::{aead, cpu, endian::*, error, polyfill};
 
 /// AES-128 in GCM mode with 128-bit tags and 96 bit nonces.
 pub static AES_128_GCM: aead::Algorithm = aead::Algorithm {
     key_len: 16,
     init: init_128,
     seal: aes_gcm_seal,
+    seal_output: aes_gcm_seal_output,
     open: aes_gcm_open,
+    open_output: aes_gcm_open_output,
     id: aead::AlgorithmID::AES_128_GCM,
     max_input_len: AES_GCM_MAX_INPUT_LEN,
+
 };
 
 /// AES-256 in GCM mode with 128-bit tags and 96 bit nonces.
@@ -38,12 +36,14 @@ pub static AES_256_GCM: aead::Algorithm = aead::Algorithm {
     key_len: 32,
     init: init_256,
     seal: aes_gcm_seal,
+    seal_output: aes_gcm_seal_output,
     open: aes_gcm_open,
+    open_output: aes_gcm_open_output,
     id: aead::AlgorithmID::AES_256_GCM,
     max_input_len: AES_GCM_MAX_INPUT_LEN,
+
 };
 
-#[derive(Clone)]
 pub struct Key {
     gcm_key: gcm::Key, // First because it has a large alignment requirement.
     aes_key: aes::Key,
@@ -63,11 +63,8 @@ fn init(
     cpu_features: cpu::Features,
 ) -> Result<aead::KeyInner, error::Unspecified> {
     let aes_key = aes::Key::new(key, variant, cpu_features)?;
-    let gcm_key = gcm::Key::new(
-        aes_key.encrypt_block(Block::zero(), cpu_features),
-        cpu_features,
-    );
-    Ok(aead::KeyInner::AesGcm(Key { gcm_key, aes_key }))
+    let gcm_key = gcm::Key::new(aes_key.encrypt_block(Block::zero()), cpu_features);
+    Ok(aead::KeyInner::AesGcm(Key { aes_key, gcm_key }))
 }
 
 const CHUNK_BLOCKS: usize = 3 * 1024 / 16;
@@ -79,92 +76,68 @@ fn aes_gcm_seal(
     in_out: &mut [u8],
     cpu_features: cpu::Features,
 ) -> Tag {
-    let Key { gcm_key, aes_key } = match key {
-        aead::KeyInner::AesGcm(key) => key,
-        _ => unreachable!(),
-    };
+    aead(key, nonce, aad, in_out, Direction::Sealing, cpu_features)
+}
 
-    let mut ctr = Counter::one(nonce);
-    let tag_iv = ctr.increment();
-
-    let total_in_out_len = in_out.len();
-    let aad_len = aad.0.len();
-    let mut auth = gcm::Context::new(gcm_key, aad, cpu_features);
-
-    #[cfg(target_arch = "x86_64")]
-    let in_out = {
-        if !aes_key.is_aes_hw(cpu_features) || !auth.is_avx() {
-            in_out
-        } else {
-            use crate::c;
-            let (htable, xi) = auth.inner();
-            prefixed_extern! {
-                // `HTable` and `Xi` should be 128-bit aligned. TODO: Can we shrink `HTable`? The
-                // assembly says it needs just nine values in that array.
-                fn aesni_gcm_encrypt(
-                    input: *const u8,
-                    output: *mut u8,
-                    len: c::size_t,
-                    key: &aes::AES_KEY,
-                    ivec: &mut Counter,
-                    Htable: &gcm::HTable,
-                    Xi: &mut gcm::Xi) -> c::size_t;
-            }
-            let processed = unsafe {
-                aesni_gcm_encrypt(
-                    in_out.as_ptr(),
-                    in_out.as_mut_ptr(),
-                    in_out.len(),
-                    aes_key.inner_less_safe(),
-                    &mut ctr,
-                    htable,
-                    xi,
-                )
-            };
-
-            &mut in_out[processed..]
-        }
-    };
-
-    let (whole, remainder) = {
-        let in_out_len = in_out.len();
-        let whole_len = in_out_len - (in_out_len % BLOCK_LEN);
-        in_out.split_at_mut(whole_len)
-    };
-
-    for chunk in whole.chunks_mut(CHUNK_BLOCKS * BLOCK_LEN) {
-        aes_key.ctr32_encrypt_within(chunk, 0.., &mut ctr, cpu_features);
-        auth.update_blocks(chunk);
-    }
-
-    if !remainder.is_empty() {
-        let mut input = Block::zero();
-        input.overwrite_part_at(0, remainder);
-        let mut output = aes_key.encrypt_iv_xor_block(ctr.into(), input, cpu_features);
-        output.zero_from(remainder.len());
-        auth.update_block(output);
-        remainder.copy_from_slice(&output.as_ref()[..remainder.len()]);
-    }
-
-    finish(
-        aes_key,
-        auth,
-        tag_iv,
-        aad_len,
-        total_in_out_len,
-        cpu_features,
-    )
+fn aes_gcm_seal_output(
+    key: &aead::KeyInner,
+    nonce: Nonce,
+    aad: Aad<&[u8]>,
+    in_out: & [u8],
+    output: &mut [u8],
+    cpu_features: cpu::Features,
+) -> Tag {
+    aead_output(key, nonce, aad, in_out, output, Direction::Sealing, cpu_features)
 }
 
 fn aes_gcm_open(
     key: &aead::KeyInner,
     nonce: Nonce,
     aad: Aad<&[u8]>,
+    in_prefix_len: usize,
     in_out: &mut [u8],
-    src: RangeFrom<usize>,
     cpu_features: cpu::Features,
 ) -> Tag {
-    let Key { gcm_key, aes_key } = match key {
+    aead(
+        key,
+        nonce,
+        aad,
+        in_out,
+        Direction::Opening { in_prefix_len },
+        cpu_features,
+    )
+}
+
+fn aes_gcm_open_output(
+    key: &aead::KeyInner,
+    nonce: Nonce,
+    aad: Aad<&[u8]>,
+    in_prefix_len: usize,
+    in_out: & [u8],
+    out: &mut [u8],
+    cpu_features: cpu::Features,
+) -> Tag {
+    aead_output(
+        key,
+        nonce,
+        aad,
+        in_out,
+        out,
+        Direction::Opening { in_prefix_len },
+        cpu_features,
+    )
+}
+
+#[inline(always)] // Avoid branching on `direction`.
+fn aead(
+    key: &aead::KeyInner,
+    nonce: Nonce,
+    aad: Aad<&[u8]>,
+    in_out: &mut [u8],
+    direction: Direction,
+    cpu_features: cpu::Features,
+) -> Tag {
+    let Key { aes_key, gcm_key } = match key {
         aead::KeyInner::AesGcm(key) => key,
         _ => unreachable!(),
     };
@@ -173,51 +146,27 @@ fn aes_gcm_open(
     let tag_iv = ctr.increment();
 
     let aad_len = aad.0.len();
-    let mut auth = gcm::Context::new(gcm_key, aad, cpu_features);
+    let mut gcm_ctx = gcm::Context::new(gcm_key, aad, cpu_features);
 
-    let in_prefix_len = src.start;
+    let in_prefix_len = match direction {
+        Direction::Opening { in_prefix_len } => in_prefix_len,
+        Direction::Sealing => 0,
+    };
 
     let total_in_out_len = in_out.len() - in_prefix_len;
 
-    #[cfg(target_arch = "x86_64")]
-    let in_out = {
-        if !aes_key.is_aes_hw(cpu_features) || !auth.is_avx() {
-            in_out
-        } else {
-            use crate::c;
-            let (htable, xi) = auth.inner();
-            prefixed_extern! {
-                // `HTable` and `Xi` should be 128-bit aligned. TODO: Can we shrink `HTable`? The
-                // assembly says it needs just nine values in that array.
-                fn aesni_gcm_decrypt(
-                    input: *const u8,
-                    output: *mut u8,
-                    len: c::size_t,
-                    key: &aes::AES_KEY,
-                    ivec: &mut Counter,
-                    Htable: &gcm::HTable,
-                    Xi: &mut gcm::Xi) -> c::size_t;
-            }
+    let in_out = integrated_aes_gcm(
+        aes_key,
+        &mut gcm_ctx,
+        in_out,
+        &mut ctr,
+        direction,
+        cpu_features,
+    );
+    let in_out_len = in_out.len() - in_prefix_len;
 
-            let processed = unsafe {
-                aesni_gcm_decrypt(
-                    in_out[src.clone()].as_ptr(),
-                    in_out.as_mut_ptr(),
-                    in_out.len() - src.start,
-                    aes_key.inner_less_safe(),
-                    &mut ctr,
-                    htable,
-                    xi,
-                )
-            };
-            &mut in_out[processed..]
-        }
-    };
-
-    let whole_len = {
-        let in_out_len = in_out.len() - in_prefix_len;
-        in_out_len - (in_out_len % BLOCK_LEN)
-    };
+    // Process any (remaining) whole blocks.
+    let whole_len = in_out_len - (in_out_len % BLOCK_LEN);
     {
         let mut chunk_len = CHUNK_BLOCKS * BLOCK_LEN;
         let mut output = 0;
@@ -230,57 +179,312 @@ fn aes_gcm_open(
                 break;
             }
 
-            auth.update_blocks(&in_out[input..][..chunk_len]);
-            aes_key.ctr32_encrypt_within(
+            if let Direction::Opening { .. } = direction {
+                gcm_ctx.update_blocks(&in_out[input..][..chunk_len]);
+            }
+
+            aes_key.ctr32_encrypt_blocks(
                 &mut in_out[output..][..(chunk_len + in_prefix_len)],
-                in_prefix_len..,
+                direction,
                 &mut ctr,
-                cpu_features,
             );
+
+            if let Direction::Sealing = direction {
+                gcm_ctx.update_blocks(&in_out[output..][..chunk_len]);
+            }
+
             output += chunk_len;
             input += chunk_len;
         }
     }
 
+    // Process any remaining partial block.
     let remainder = &mut in_out[whole_len..];
     shift::shift_partial((in_prefix_len, remainder), |remainder| {
         let mut input = Block::zero();
         input.overwrite_part_at(0, remainder);
-        auth.update_block(input);
-        aes_key.encrypt_iv_xor_block(ctr.into(), input, cpu_features)
+        if let Direction::Opening { .. } = direction {
+            gcm_ctx.update_block(input);
+        }
+        let mut output = aes_key.encrypt_iv_xor_block(ctr.into(), input);
+        if let Direction::Sealing = direction {
+            output.zero_from(remainder.len());
+            gcm_ctx.update_block(output);
+        }
+        output
     });
 
-    finish(
-        aes_key,
-        auth,
-        tag_iv,
-        aad_len,
-        total_in_out_len,
-        cpu_features,
-    )
-}
-
-fn finish(
-    aes_key: &aes::Key,
-    mut gcm_ctx: gcm::Context,
-    tag_iv: aes::Iv,
-    aad_len: usize,
-    in_out_len: usize,
-    cpu_features: cpu::Features,
-) -> Tag {
     // Authenticate the final block containing the input lengths.
     let aad_bits = polyfill::u64_from_usize(aad_len) << 3;
-    let ciphertext_bits = polyfill::u64_from_usize(in_out_len) << 3;
-    gcm_ctx.update_block(Block::from(
-        [aad_bits, ciphertext_bits].map(u64::to_be_bytes),
+    let ciphertext_bits = polyfill::u64_from_usize(total_in_out_len) << 3;
+    gcm_ctx.update_block(Block::from_u64_be(
+        BigEndian::from(aad_bits),
+        BigEndian::from(ciphertext_bits),
     ));
 
     // Finalize the tag and return it.
     gcm_ctx.pre_finish(|pre_tag| {
-        let encrypted_iv = aes_key.encrypt_block(tag_iv.into_block_less_safe(), cpu_features);
-        let tag = pre_tag ^ encrypted_iv;
+        let bytes = tag_iv.into_bytes_less_safe();
+        let mut tag = aes_key.encrypt_block(Block::from(&bytes));
+        tag.bitxor_assign(pre_tag.into());
         Tag(*tag.as_ref())
     })
+}
+
+#[inline(always)] // Avoid branching on `direction`.
+fn aead_output(
+    key: &aead::KeyInner,
+    nonce: Nonce,
+    aad: Aad<&[u8]>,
+    in_out: & [u8],
+    out: &mut [u8],
+    direction: Direction,
+    cpu_features: cpu::Features,
+) -> Tag {
+    let Key { aes_key, gcm_key } = match key {
+        aead::KeyInner::AesGcm(key) => key,
+        _ => unreachable!(),
+    };
+
+    let mut ctr = Counter::one(nonce);
+    let tag_iv = ctr.increment();
+
+    let aad_len = aad.0.len();
+    let mut gcm_ctx = gcm::Context::new(gcm_key, aad, cpu_features);
+
+    let in_prefix_len = match direction {
+        Direction::Opening { in_prefix_len } => in_prefix_len,
+        Direction::Sealing => 0,
+    };
+
+    let total_in_out_len = in_out.len() - in_prefix_len;
+
+    let (out_remaining, input_remaining) = integrated_aes_gcm_output(
+        aes_key,
+        &mut gcm_ctx,
+        in_out,
+        out,
+        &mut ctr,
+        direction,
+        cpu_features,
+    );
+
+    let in_out_len = input_remaining.len() - in_prefix_len;
+
+    // Process any (remaining) whole blocks.
+    let whole_len = in_out_len - (in_out_len % BLOCK_LEN);
+    {
+        let mut chunk_len = CHUNK_BLOCKS * BLOCK_LEN;
+        let mut output = 0;
+        let mut input = in_prefix_len;
+        loop {
+            if whole_len - output < chunk_len {
+                chunk_len = whole_len - output;
+            }
+            if chunk_len == 0 {
+                break;
+            }
+
+            if let Direction::Opening { .. } = direction {
+                gcm_ctx.update_blocks(&input_remaining[input..][..chunk_len]);
+            }
+
+            aes_key.ctr32_encrypt_blocks_out(
+                & input_remaining[output..][..(chunk_len + in_prefix_len)],
+                &mut out_remaining[output..][..(chunk_len + in_prefix_len)],
+                direction,
+                &mut ctr,
+            );
+
+            if let Direction::Sealing = direction {
+                gcm_ctx.update_blocks(&out_remaining[output..][..chunk_len]);
+            }
+
+            output += chunk_len;
+            input += chunk_len;
+        }
+    }
+
+    // Process any remaining partial block.
+    let remainder = & input_remaining[whole_len..];
+    let remainder_out = &mut out_remaining[whole_len..];
+    shift::shift_partial_output((in_prefix_len, remainder, remainder_out), |remainder| {
+        let mut input = Block::zero();
+        input.overwrite_part_at(0, remainder);
+        if let Direction::Opening { .. } = direction {
+            gcm_ctx.update_block(input);
+        }
+        let mut output = aes_key.encrypt_iv_xor_block(ctr.into(), input);
+        if let Direction::Sealing = direction {
+            output.zero_from(remainder.len());
+            gcm_ctx.update_block(output);
+        }
+        output
+    });
+
+    // Authenticate the final block containing the input lengths.
+    let aad_bits = polyfill::u64_from_usize(aad_len) << 3;
+    let ciphertext_bits = polyfill::u64_from_usize(total_in_out_len) << 3;
+    gcm_ctx.update_block(Block::from_u64_be(
+        BigEndian::from(aad_bits),
+        BigEndian::from(ciphertext_bits),
+    ));
+
+    // Finalize the tag and return it.
+    gcm_ctx.pre_finish(|pre_tag| {
+        let bytes = tag_iv.into_bytes_less_safe();
+        let mut tag = aes_key.encrypt_block(Block::from(&bytes));
+        tag.bitxor_assign(pre_tag.into());
+        Tag(*tag.as_ref())
+    })
+}
+
+// Returns the data that wasn't processed.
+#[cfg(target_arch = "x86_64")]
+#[inline] // Optimize out the match on `direction`.
+fn integrated_aes_gcm<'a>(
+    aes_key: &aes::Key,
+    gcm_ctx: &mut gcm::Context,
+    in_out: &'a mut [u8],
+    ctr: &mut Counter,
+    direction: Direction,
+    cpu_features: cpu::Features,
+) -> &'a mut [u8] {
+    use crate::c;
+
+    if !aes_key.is_aes_hw() || !gcm_ctx.is_avx2(cpu_features) {
+        return in_out;
+    }
+
+    let processed = match direction {
+        Direction::Opening { in_prefix_len } => {
+            extern "C" {
+                fn GFp_aesni_gcm_decrypt(
+                    input: *const u8,
+                    output: *mut u8,
+                    len: c::size_t,
+                    key: &aes::AES_KEY,
+                    ivec: &mut Counter,
+                    gcm: &mut gcm::ContextInner,
+                ) -> c::size_t;
+            }
+            unsafe {
+                GFp_aesni_gcm_decrypt(
+                    in_out[in_prefix_len..].as_ptr(),
+                    in_out.as_mut_ptr(),
+                    in_out.len() - in_prefix_len,
+                    aes_key.inner_less_safe(),
+                    ctr,
+                    gcm_ctx.inner(),
+                )
+            }
+        }
+        Direction::Sealing => {
+            extern "C" {
+                fn GFp_aesni_gcm_encrypt(
+                    input: *const u8,
+                    output: *mut u8,
+                    len: c::size_t,
+                    key: &aes::AES_KEY,
+                    ivec: &mut Counter,
+                    gcm: &mut gcm::ContextInner,
+                ) -> c::size_t;
+            }
+            unsafe {
+                GFp_aesni_gcm_encrypt(
+                    in_out.as_ptr(),
+                    in_out.as_mut_ptr(),
+                    in_out.len(),
+                    aes_key.inner_less_safe(),
+                    ctr,
+                    gcm_ctx.inner(),
+                )
+            }
+        }
+    };
+
+    &mut in_out[processed..]
+}
+
+// Returns the data that wasn't processed.
+#[cfg(target_arch = "x86_64")]
+#[inline] // Optimize out the match on `direction`.
+fn integrated_aes_gcm_output<'a>(
+    aes_key: &aes::Key,
+    gcm_ctx: &mut gcm::Context,
+    input: &'a [u8],
+    out_buf: &'a mut [u8],
+    ctr: &mut Counter,
+    direction: Direction,
+    cpu_features: cpu::Features,
+) -> (&'a mut [u8], &'a [u8]){
+    use crate::c;
+
+    if !aes_key.is_aes_hw() || !gcm_ctx.is_avx2(cpu_features) {
+        return (out_buf, input);
+    }
+
+    let processed = match direction {
+        Direction::Opening { in_prefix_len } => {
+            extern "C" {
+                fn GFp_aesni_gcm_decrypt(
+                    input: *const u8,
+                    output: *mut u8,
+                    len: c::size_t,
+                    key: &aes::AES_KEY,
+                    ivec: &mut Counter,
+                    gcm: &mut gcm::ContextInner,
+                ) -> c::size_t;
+            }
+            unsafe {
+                GFp_aesni_gcm_decrypt(
+                    input[in_prefix_len..].as_ptr(),
+                    out_buf[..input.len()].as_mut_ptr(),
+                    input.len() - in_prefix_len,
+                    aes_key.inner_less_safe(),
+                    ctr,
+                    gcm_ctx.inner(),
+                )
+            }
+        }
+        Direction::Sealing => {
+            extern "C" {
+                fn GFp_aesni_gcm_encrypt(
+                    input: *const u8,
+                    output: *mut u8,
+                    len: c::size_t,
+                    key: &aes::AES_KEY,
+                    ivec: &mut Counter,
+                    gcm: &mut gcm::ContextInner,
+                ) -> c::size_t;
+            }
+            unsafe {
+                GFp_aesni_gcm_encrypt(
+                    input.as_ptr(),
+                    out_buf.as_mut_ptr(),
+                    input.len(),
+                    aes_key.inner_less_safe(),
+                    ctr,
+                    gcm_ctx.inner(),
+                )
+            }
+        }
+    };
+
+    (&mut out_buf[processed..input.len()], & input[processed..])
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+fn integrated_aes_gcm<'a>(
+    _: &aes::Key,
+    _: &mut gcm::Context,
+    in_out: &'a mut [u8],
+    _: &mut Counter,
+    _: Direction,
+    _: cpu::Features,
+) -> &'a mut [u8] {
+    in_out // This doesn't process any of the input so it all remains.
 }
 
 const AES_GCM_MAX_INPUT_LEN: u64 = super::max_input_len(BLOCK_LEN, 2);

@@ -34,7 +34,8 @@ use super::{
     chacha20_poly1305::derive_poly1305_key,
     cpu, poly1305, Nonce, Tag,
 };
-use crate::{constant_time, error};
+use crate::{constant_time, endian::*, error};
+use core::convert::TryInto;
 
 /// A key for sealing packets.
 pub struct SealingKey {
@@ -43,9 +44,9 @@ pub struct SealingKey {
 
 impl SealingKey {
     /// Constructs a new `SealingKey`.
-    pub fn new(key_material: &[u8; KEY_LEN]) -> Self {
-        Self {
-            key: Key::new(key_material),
+    pub fn new(key_material: &[u8; KEY_LEN]) -> SealingKey {
+        SealingKey {
+            key: Key::new(key_material, cpu::features()),
         }
     }
 
@@ -62,9 +63,9 @@ impl SealingKey {
         plaintext_in_ciphertext_out: &mut [u8],
         tag_out: &mut [u8; TAG_LEN],
     ) {
-        let cpu_features = cpu::features();
         let mut counter = make_counter(sequence_number);
-        let poly_key = derive_poly1305_key(&self.key.k_2, counter.increment());
+        let poly_key =
+            derive_poly1305_key(&self.key.k_2, counter.increment(), self.key.cpu_features);
 
         {
             let (len_in_out, data_and_padding_in_out) =
@@ -78,7 +79,7 @@ impl SealingKey {
                 .encrypt_in_place(counter, data_and_padding_in_out);
         }
 
-        let Tag(tag) = poly1305::sign(poly_key, plaintext_in_ciphertext_out, cpu_features);
+        let Tag(tag) = poly1305::sign(poly_key, plaintext_in_ciphertext_out);
         tag_out.copy_from_slice(tag.as_ref());
     }
 }
@@ -90,9 +91,9 @@ pub struct OpeningKey {
 
 impl OpeningKey {
     /// Constructs a new `OpeningKey`.
-    pub fn new(key_material: &[u8; KEY_LEN]) -> Self {
-        Self {
-            key: Key::new(key_material),
+    pub fn new(key_material: &[u8; KEY_LEN]) -> OpeningKey {
+        OpeningKey {
+            key: Key::new(key_material, cpu::features()),
         }
     }
 
@@ -131,7 +132,8 @@ impl OpeningKey {
         // We must verify the tag before decrypting so that
         // `ciphertext_in_plaintext_out` is unmodified if verification fails.
         // This is beyond what we guarantee.
-        let poly_key = derive_poly1305_key(&self.key.k_2, counter.increment());
+        let poly_key =
+            derive_poly1305_key(&self.key.k_2, counter.increment(), self.key.cpu_features);
         verify(poly_key, ciphertext_in_plaintext_out, tag)?;
 
         let plaintext_in_ciphertext_out = &mut ciphertext_in_plaintext_out[PACKET_LENGTH_LEN..];
@@ -146,23 +148,30 @@ impl OpeningKey {
 struct Key {
     k_1: chacha::Key,
     k_2: chacha::Key,
+    cpu_features: cpu::Features,
 }
 
 impl Key {
-    fn new(key_material: &[u8; KEY_LEN]) -> Self {
+    fn new(key_material: &[u8; KEY_LEN], cpu_features: cpu::Features) -> Key {
         // The first half becomes K_2 and the second half becomes K_1.
         let (k_2, k_1) = key_material.split_at(chacha::KEY_LEN);
-        Self {
-            k_1: chacha::Key::new(k_1.try_into().unwrap()),
-            k_2: chacha::Key::new(k_2.try_into().unwrap()),
+        let k_1: [u8; chacha::KEY_LEN] = k_1.try_into().unwrap();
+        let k_2: [u8; chacha::KEY_LEN] = k_2.try_into().unwrap();
+        Key {
+            k_1: chacha::Key::from(k_1),
+            k_2: chacha::Key::from(k_2),
+            cpu_features,
         }
     }
 }
 
 fn make_counter(sequence_number: u32) -> Counter {
-    let [s0, s1, s2, s3] = sequence_number.to_be_bytes();
-    let nonce = [0, 0, 0, 0, 0, 0, 0, 0, s0, s1, s2, s3];
-    Counter::zero(Nonce::assume_unique_for_key(nonce))
+    let nonce = [
+        BigEndian::ZERO,
+        BigEndian::ZERO,
+        BigEndian::from(sequence_number),
+    ];
+    Counter::zero(Nonce::assume_unique_for_key(*(nonce.as_byte_array())))
 }
 
 /// The length of key.
@@ -172,9 +181,9 @@ pub const KEY_LEN: usize = chacha::KEY_LEN * 2;
 pub const PACKET_LENGTH_LEN: usize = 4; // 32 bits
 
 /// The length in bytes of an authentication tag.
-pub const TAG_LEN: usize = super::TAG_LEN;
+pub const TAG_LEN: usize = super::BLOCK_LEN;
 
 fn verify(key: poly1305::Key, msg: &[u8], tag: &[u8; TAG_LEN]) -> Result<(), error::Unspecified> {
-    let Tag(calculated_tag) = poly1305::sign(key, msg, cpu::features());
+    let Tag(calculated_tag) = poly1305::sign(key, msg);
     constant_time::verify_slices_are_equal(calculated_tag.as_ref(), tag)
 }

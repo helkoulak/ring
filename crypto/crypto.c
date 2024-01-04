@@ -12,7 +12,8 @@
  * OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
  * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE. */
 
-#include <ring-core/base.h>
+#include <GFp/cpu.h>
+#include "internal.h"
 
 // Our assembly does not use the GOT to reference symbols, which means
 // references to visible symbols will often require a TEXTREL. This is
@@ -33,7 +34,5 @@
 // archive, linking on OS X will fail to resolve common symbols. By
 // initialising it to zero, it becomes a "data symbol", which isn't so
 // affected.
-HIDDEN uint32_t OPENSSL_ia32cap_P[4] = {0};
-#elif defined(OPENSSL_ARM) || defined(OPENSSL_AARCH64)
-HIDDEN uint32_t OPENSSL_armcap_P = 0;
+HIDDEN uint32_t GFp_ia32cap_P[4] = {0};
 #endif
